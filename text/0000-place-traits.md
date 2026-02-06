@@ -6,11 +6,10 @@
 ## Summary
 [summary]: #summary
 
-This RFC introduces the `Place` and `CreatablePlace` traits. These traits allow for
-arbitrary types to implement the special behavior of the `Box` type. In particular, it
-allows an arbitrary type to act as an owned place allowing values to be (partially) moved
-out and moved back in again, and allows for initialization directly in the space allocated
-by the type instead of through a copy via the stack similar to what `Box::new` supports.
+This RFC introduces the `Place` trait. This trait allows arbitrary types to implement the
+special derefence behavior of the `Box` type. In particular, it allows an arbitrary type
+to act as an owned place allowing values to be (partially) moved out and moved back in
+again.
 
 ## Motivation
 [motivation]: #motivation
@@ -22,10 +21,9 @@ instantiation of other types in the storage allocated by it.
 This special status comes with two challenges. First of all, Box gets its special status
 by being deeply interwoven with the compiler. This is somewhat problematic as it requires
 exactly matched definitions of how the type looks between various parts of the compiler
-and the standard library. Furthermore, it makes it harder to generalize the copy-less
-initialization of boxes to arbitrary allocators. Moving box over to a place trait would
-provide a more pleasant and straightforward interface between the compiler and the box
-type.
+and the standard library. Moving box over to a place trait would provide a more pleasant
+and straightforward interface between the compiler and the box type, at least in regards
+to the move behavior.
 
 Second, it is currently impossible to provide a safe interface for user-defined smart
 pointer types which provide the option of moving data in and out of it. There have been
@@ -33,27 +31,13 @@ identified a number of places where such functionality could be interesting, suc
 removing values from containers, or when building custom smart pointer types for example
 in the context of an implementation of garbage collection.
 
-The traits presented here would also provide workarounds for the problem of initializing
-static variables without first having to construct their value on the stack. This would
-solve known problems on embedded platforms, where sometimes people have to use unsafe
-workarounds for such initializations.
-
 ## Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-This proposal introduces two new unsafe traits: `Place` and `CreatablePlace`:
+This proposal introduces a new unsafe trait `Place`:
 ```rust
 unsafe trait Place: DerefMut {
     fn place(&mut self) -> *mut Self::Target
-}
-
-unsafe trait CreatablePlace: Place {
-    type Args
-
-    unsafe fn new_uninit(args: Self::Args) -> Self;
-
-    // Provided
-    fn new(args: Self::Args, value: Self::Target) -> Self {/* omitted */}
 }
 ```
 
@@ -71,32 +55,14 @@ fn baz(mut x: Foo) -> Foo {
 }
 ```
 
-The `CreatablePlace` trait then further generalizes the special behavior of `Box::new`.
-When implemented, it exposes to the compiler the potential for the optimization of
-constructing the value directly in the space allocated for it by the type. For example,
-today for an expression like `Box::new([0u8;4*1024*1024])`, the compiler has the option of
-optimizing this by creating the 4 Mb large array in the new allocation, instead of first
-creating it on the stack and then moving it. Should a type `Foo` implement CreatablePlace
-then the same optimization will be possible for `Foo::new(some_args, [0u8;4*1024*1024])`,
-as the compiler can now desugare that call to something similar to
-```rust
-unsafe {
-    let x = Foo::new_uninit(some_args);
-    *x = [0u8;4*1024*1024];
-}
-```
+When implementing this trait, the type itself effectively transfers some of the responsibilities for managing the value behind the pointer returned by `Place::place`, also called the content, to the compiler. In particular, the type itself should no longer count on the ccontent being properly initialized and dropable when its `Drop` implementation or `Place::place` implementation is called. However, the compiler still guarantees that, as long as the type implementing the place is always created with a value in it, and that value is never removed through a different mechanism than dereferencing the type, all other calls to member functions can assume the value to be implemented.
 
-When implementing these traits, it is necessary that the type guarantees the following
-properties in order to be sound:
+In general, the compilers requirements are met when
 - The pointer returned by `place` should be safe to mutate through, and should be live
-  for the lifetime of `self`.
-- On consecutive calls to `place`, the pointer returned should point to the same value.
-  Note that it is allowed for the actual location pointed to by the pointer to change so
-  long as the bytes representing the value have been moved to that new location.
-- Drop must not try to drop the value returned by `place`, as this will be handled by the
-  compiler itself.
-- Values of the type for which `place` would return an uninitialized value should never be
-  explicitly created, except by the new_uninit function.
+  for the lifetime of the mutable reference to `self` passed to `Place::place`.
+- On consecutive calls to `Place::place`, the status of whether the content is initialized should not be changed.
+- Drop must not drop the contents, only the storage for it.
+- Newly initialized values of the type implementing `Place` must have their content initialized.
 
 There is one oddity in the behavior of types implementing `Place` to be aware of.
 Automatically elaborated dereferences of values of such types will always trigger an abort
@@ -107,20 +73,13 @@ dereferencing, even if the underlying type also implements Place.
 ## Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
-This proposal introduces two main language items, the traits `Place` and `CreatablePlace`.
-We also introduce a number of secondary language items which are used to make
-implementation easier and more robust, which we shall define as they come up below.
+This proposal introduces one new main language item, the traits `Place`. We also introduce a number of secondary language items which are used to make implementation easier and more robust, which we shall define as they come up below.
 
-A type implementing the trait Place is required to act as a place for borrow checking. In
-particular
-- The value behind the pointer of `Place::place` shall only be mutatable in safe code
-  through dereferencing the Place implementing type.
-- Unsafe code shall preserve the initialization status of the pointer pointed at by
-  `Place::place`.
-- The drop function of the type shall not drop the value exposed through the `Place`
-  trait.
-- Values of the place type for which the pointer returned by `Place::place` is not
-  initialized or has been moved out of shall not be able to be created in safe code.
+A type implementing the trait Place is required to act as a place for borrow checking. Throughout the rest of this text, the contents of the memory pointed at by the pointer returned by the `Place::place` function shall be refered to as the content of the place. For a type to satisfy the above requirement, its implementation must in particular guarantee that
+- Safe code shall not modify the initialization status of the contents.
+- Unsafe code shall preserve the initialization status of the contents between two derefences of teh type's values.
+- Values of the place type for which the content is uninitialized shall not be able to be created in safe code.
+In the above context, the contents is also considered uniitialized if the whole or parts of the value of the contents has been moved out, or a destructor has been called upon them.
 
 Dereferences of a type implementing `Place` can therefore be lowered directly to MIR, only
 being elaborated in a pass after borrow checking. This allows the borrow checker to fully
@@ -134,16 +93,6 @@ elaboration and new execution paths not checked by the borrow checker.
 
 In order to generate the function calls to the `Place::place` and `Deref::deref` during
 the dereference elaboration we propose making these functions additional language items.
-
-For the implementation of `CreatablePlace` we propose the introduction of a compiler
-intrinsic `emplace`, similar to `box_new`. This intrinsic can then expand during MIR
-lowering in the same way as box_new, but replacing the call to the allocator with a call
-to `CreatablePlace::new_uninit`. A similar intrinsic to `ShallowInitBox` can then be used
-to mark the resulting value properly for the borrow checker.
-
-The `emplace` compiler intrinsic can then be used to provide the implementation for
-`CreatablePlace::new`, similar to how `box_new` is used to implement the special behavior
-of `Box::new`.
 
 ## Drawbacks
 [drawbacks]: #drawbacks
@@ -250,14 +199,14 @@ compared to the `Deref` and `DerefMut` traits.
 ### Existing library based solutions
 
 The [moveit library](https://docs.rs/moveit/latest/moveit/index.html) provides similar
-functionality in its `DerefMove` and `Emplace` traits. However, these require unsafe code
-on the part of the end user of the traits, which makes them unattractive for developers
-wanting the memory safety guarantees rust provides.
+functionality in its `DerefMove` trait. However, this requires unsafe code on the part of
+the end user of the trait, which makes them unattractive for developers wanting the
+memory safety guarantees rust provides.
 
 ## Prior art
 [prior-art]: #prior-art
 
-The behavior enabled by the traits proposed here is already implemented for the Box type,
+The behavior enabled by the trait proposed here is already implemented for the Box type,
 which can be considered prime prior art. Experience with the Box type has shown that its
 special behaviors have applications.
 
@@ -269,7 +218,7 @@ value as there is no intrinsic language-level way of dealing with moved-out of p
 a special way.
 
 In terms of implementability, a small experiment has been done implementing the deref
-elaboration for a joined-together version of these traits at
+elaboration for an earlier version of this trait at
 https://github.com/davidv1992/rust/tree/place-experiment. That implementation is
 sufficiently far along to support running code using the Place trait, but does not yet
 properly drop the internal value, instead leaking it.
@@ -292,8 +241,8 @@ code.
 [future-possibilities]: #future-possibilities
 
 Should the trait become stabilized, it may become interesting to implement non-copying
-variants of the various push and pop functions on containers within the standard library.
-Such functions could allow significant optimizations when used in combination with large
+variants of the various pop functions on containers within the standard library. Such
+functions could allow significant optimizations when used in combination with large
 elements in the container.
 
 It may also be interesting at a future point to reconsider whether the unsized_fn_params
@@ -301,7 +250,8 @@ trait should remain internal, in particular once Unsized coercions become usable
 defined types. However, this decision can be delayed to a later date as sufficiently many
 interesting use cases are already available without it.
 
-There currently is sustained interest in having good solutions for dealing with values in
-place from the rust-for-linux project. Although this is not a complete solution to those
-problems, the traits proposed here may form part of the solution to in-place creation of
-values for various types that need this.
+Finally, there is potential for the trait as presented here to become useful in the in
+place initialization project. It could be a building block for generalizing things like
+partial initialization to smart pointers. This would require future design around an api
+for telling the borrow checker about new empty values implementing Place, but that seems
+orthogonal to the design here.
